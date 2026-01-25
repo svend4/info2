@@ -48,7 +48,9 @@
     "compression": "^1.7.4",
     "winston": "^3.10.0",
     "joi": "^17.9.2",
-    "swagger-ui-express": "^5.0.0"
+    "swagger-ui-express": "^5.0.0",
+    "@elastic/elasticsearch": "^8.10.0",
+    "prom-client": "^15.0.0"
   },
   "devDependencies": {
     "nodemon": "^3.0.1",
