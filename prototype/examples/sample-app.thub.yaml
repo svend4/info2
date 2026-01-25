@@ -1,0 +1,339 @@
+# T-Hub Application Manifest
+# Пример: E-commerce Application
+
+apiVersion: thub.io/v1
+kind: Application
+
+metadata:
+  name: my-ecommerce-app
+  version: 1.0.0
+  description: Full-featured e-commerce platform
+  author:
+    name: John Doe
+    email: john@example.com
+  license: MIT
+  homepage: https://github.com/example/my-ecommerce-app
+
+# ============================================================================
+# Components Declaration
+# ============================================================================
+components:
+  # Backend Components
+  backend:
+    # Authentication
+    - name: jwt-generator
+      version: ^2.1.0
+      from: thub://auth/jwt-generator
+      alias: auth/jwt
+
+    - name: oauth2-provider
+      version: ^3.0.0
+      from: thub://auth/oauth2-provider
+
+    # API
+    - name: rate-limiter
+      version: ^2.0.0
+      from: thub://api/rate-limiter
+      config:
+        windowMs: 60000
+        max: 100
+
+    - name: rest-router
+      version: ^4.2.0
+      from: thub://api/rest-router
+
+    - name: graphql-resolver
+      version: ^5.1.0
+      from: thub://api/graphql-resolver
+
+    # Data
+    - name: postgres-orm
+      version: ^5.1.0
+      from: thub://data/postgres-orm
+
+    - name: query-builder
+      version: ^3.2.0
+      from: thub://data/query-builder
+
+    - name: redis-cache
+      version: ^3.0.0
+      from: thub://cache/redis-adapter
+
+    # Validation
+    - name: validator
+      version: ^1.5.0
+      from: thub://utils/validator
+
+    # Payments
+    - name: stripe-integration
+      version: ^2.5.0
+      from: thub://payments/stripe-integration
+
+    # Email
+    - name: email-sender
+      version: ^1.8.0
+      from: thub://communication/email-sender
+
+    # Unique Business Logic (Local Files)
+    - name: shopping-cart
+      version: 1.0.0
+      from: file://./src/backend/shopping-cart.js
+      unique: true
+
+    - name: product-catalog
+      version: 1.0.0
+      from: file://./src/backend/product-catalog.js
+      unique: true
+
+    - name: order-processor
+      version: 1.0.0
+      from: file://./src/backend/order-processor.js
+      unique: true
+
+    - name: inventory-manager
+      version: 1.0.0
+      from: file://./src/backend/inventory-manager.js
+      unique: true
+
+  # Frontend Components
+  frontend:
+    # Framework
+    - name: react
+      version: ^18.2.0
+      from: npm://react
+
+    - name: react-router
+      version: ^6.8.0
+      from: npm://react-router-dom
+
+    # UI Library
+    - name: material-ui
+      version: ^5.11.0
+      from: npm://@mui/material
+
+    - name: tailwind-css
+      version: ^3.2.0
+      from: npm://tailwindcss
+
+    # State Management
+    - name: redux-toolkit
+      version: ^1.9.0
+      from: npm://@reduxjs/toolkit
+
+    # HTTP Client
+    - name: axios
+      version: ^1.3.0
+      from: npm://axios
+
+    # Forms
+    - name: formik
+      version: ^2.2.0
+      from: npm://formik
+
+    # Unique UI Components (Local Files)
+    - name: ProductCard
+      version: 1.0.0
+      from: file://./src/frontend/components/ProductCard.jsx
+      unique: true
+
+    - name: CheckoutFlow
+      version: 1.0.0
+      from: file://./src/frontend/components/CheckoutFlow.jsx
+      unique: true
+
+    - name: UserDashboard
+      version: 1.0.0
+      from: file://./src/frontend/components/UserDashboard.jsx
+      unique: true
+
+# ============================================================================
+# Configuration
+# ============================================================================
+configuration:
+  # Database
+  database:
+    type: postgresql
+    host: ${DB_HOST:-localhost}
+    port: ${DB_PORT:-5432}
+    name: ${DB_NAME:-ecommerce}
+    user: ${DB_USER}
+    password: ${DB_PASSWORD}
+    pool:
+      min: 2
+      max: 10
+    ssl: ${DB_SSL:-false}
+
+  # Cache
+  cache:
+    type: redis
+    host: ${REDIS_HOST:-localhost}
+    port: ${REDIS_PORT:-6379}
+    ttl: 3600
+    prefix: "ecommerce:"
+
+  # Authentication
+  auth:
+    jwtSecret: ${JWT_SECRET}
+    jwtExpiry: 86400 # 24 hours
+    refreshTokenExpiry: 604800 # 7 days
+    oauth:
+      google:
+        clientId: ${GOOGLE_CLIENT_ID}
+        clientSecret: ${GOOGLE_CLIENT_SECRET}
+      facebook:
+        clientId: ${FACEBOOK_CLIENT_ID}
+        clientSecret: ${FACEBOOK_CLIENT_SECRET}
+
+  # Payment
+  payment:
+    provider: stripe
+    apiKey: ${STRIPE_API_KEY}
+    webhookSecret: ${STRIPE_WEBHOOK_SECRET}
+    currency: usd
+
+  # Email
+  email:
+    provider: sendgrid
+    apiKey: ${SENDGRID_API_KEY}
+    from: noreply@example.com
+    templates:
+      orderConfirmation: d-xxxxx
+      passwordReset: d-yyyyy
+
+  # Storage
+  storage:
+    type: s3
+    bucket: ${S3_BUCKET}
+    region: ${AWS_REGION}
+    accessKeyId: ${AWS_ACCESS_KEY_ID}
+    secretAccessKey: ${AWS_SECRET_ACCESS_KEY}
+
+# ============================================================================
+# Deployment
+# ============================================================================
+deployment:
+  platform: kubernetes
+
+  # Kubernetes Configuration
+  kubernetes:
+    namespace: production
+    replicas: 3
+
+    resources:
+      backend:
+        requests:
+          memory: "256Mi"
+          cpu: "250m"
+        limits:
+          memory: "512Mi"
+          cpu: "500m"
+
+      frontend:
+        requests:
+          memory: "128Mi"
+          cpu: "100m"
+        limits:
+          memory: "256Mi"
+          cpu: "200m"
+
+    # Autoscaling
+    autoscaling:
+      enabled: true
+      minReplicas: 3
+      maxReplicas: 10
+      targetCPUUtilization: 80
+
+    # Health Checks
+    livenessProbe:
+      httpGet:
+        path: /health
+        port: 3000
+      initialDelaySeconds: 30
+      periodSeconds: 10
+
+    readinessProbe:
+      httpGet:
+        path: /ready
+        port: 3000
+      initialDelaySeconds: 5
+      periodSeconds: 5
+
+  # Environment Variables
+  env:
+    - name: NODE_ENV
+      value: production
+    - name: PORT
+      value: "3000"
+    - name: LOG_LEVEL
+      value: info
+
+  # Secrets (from Kubernetes Secrets)
+  secrets:
+    - DATABASE_URL
+    - JWT_SECRET
+    - STRIPE_API_KEY
+    - SENDGRID_API_KEY
+
+# ============================================================================
+# CI/CD
+# ============================================================================
+cicd:
+  pipeline:
+    - stage: test
+      steps:
+        - npm run lint
+        - npm run test
+        - npm run test:integration
+
+    - stage: build
+      steps:
+        - thub build --output ./dist
+        - docker build -t myapp:${VERSION} .
+
+    - stage: deploy
+      steps:
+        - kubectl apply -f k8s/
+        - kubectl rollout status deployment/myapp
+
+# ============================================================================
+# Monitoring
+# ============================================================================
+monitoring:
+  prometheus:
+    enabled: true
+    path: /metrics
+    port: 9090
+
+  logging:
+    level: info
+    format: json
+    outputs:
+      - console
+      - file://./logs/app.log
+      - elasticsearch://logs-cluster:9200
+
+  tracing:
+    enabled: true
+    provider: jaeger
+    endpoint: http://jaeger:14268/api/traces
+
+# ============================================================================
+# Analytics
+# ============================================================================
+analytics:
+  deduplication:
+    standardComponents: 85%  # 85% кода из T-Hub
+    uniqueComponents: 15%    # 15% уникального кода
+    totalSize: 2.3 MB
+    savingsVsTraditional: 7.7 MB (77%)
+
+  performance:
+    buildTime: 12s
+    deployTime: 45s
+    coldStart: <2s
+
+  quality:
+    testCoverage: 92%
+    securityScore: 98/100
+    maintainability: A
+    dependencies: 23 (all audited)
