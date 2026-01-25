@@ -8,7 +8,27 @@ const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const compression = require('compression');
+const swaggerUi = require('swagger-ui-express');
 const { createLogger, format, transports } = require('winston');
+const { getDatabase, ComponentRepository, UserRepository } = require('../db');
+const {
+  hashPassword,
+  verifyPassword,
+  generateToken,
+  authenticate,
+  optionalAuthenticate,
+  authorize,
+  validateRegistration,
+  authRateLimit
+} = require('./auth');
+
+// Initialize database
+const db = getDatabase();
+const componentRepo = new ComponentRepository(db);
+const userRepo = new UserRepository(db);
+
+// Load Swagger spec
+const swaggerDocument = require('./swagger.json');
 
 // Middleware
 const app = express();
@@ -45,16 +65,25 @@ app.use((req, res, next) => {
   next();
 });
 
+// Swagger UI
+app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(swaggerDocument, {
+  customSiteTitle: 'T-Hub API Documentation',
+  customCss: '.swagger-ui .topbar { display: none }'
+}));
+
 // ============================================================================
 // ROUTES: Health Check
 // ============================================================================
 
-app.get('/health', (req, res) => {
+app.get('/health', async (req, res) => {
+  const dbHealthy = await db.testConnection();
+
   res.json({
-    status: 'ok',
+    status: dbHealthy ? 'ok' : 'degraded',
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
-    version: '0.1.0'
+    version: '0.1.0',
+    database: dbHealthy ? 'connected' : 'disconnected'
   });
 });
 
@@ -71,402 +100,510 @@ app.get('/api/v1/status', (req, res) => {
 });
 
 // ============================================================================
+// ROUTES: Authentication
+// ============================================================================
+
+// POST /api/v1/auth/register - Register new user
+app.post('/api/v1/auth/register', authRateLimit, async (req, res) => {
+  try {
+    const { username, email, password, full_name } = req.body;
+
+    // Validate input
+    const validation = validateRegistration({ username, email, password });
+    if (!validation.valid) {
+      return res.status(400).json({
+        error: 'Validation failed',
+        errors: validation.errors
+      });
+    }
+
+    // Check if user already exists
+    const existingUser = await userRepo.findByEmail(email);
+    if (existingUser) {
+      return res.status(409).json({
+        error: 'User already exists',
+        message: 'A user with this email address already exists'
+      });
+    }
+
+    const existingUsername = await userRepo.findByUsername(username);
+    if (existingUsername) {
+      return res.status(409).json({
+        error: 'Username taken',
+        message: 'This username is already taken'
+      });
+    }
+
+    // Hash password and create user
+    const password_hash = await hashPassword(password);
+    const user = await userRepo.create({
+      username,
+      email,
+      password_hash,
+      full_name
+    });
+
+    // Generate JWT token
+    const token = generateToken({
+      userId: user.id,
+      username: user.username,
+      email: user.email,
+      role: 'user'
+    });
+
+    logger.info(`User registered: ${username}`);
+
+    res.status(201).json({
+      message: 'User registered successfully',
+      user: {
+        id: user.id,
+        username: user.username,
+        email: user.email,
+        full_name: user.full_name
+      },
+      token
+    });
+  } catch (error) {
+    logger.error('Registration error:', error);
+    res.status(500).json({
+      error: 'Registration failed',
+      message: 'An error occurred during registration'
+    });
+  }
+});
+
+// POST /api/v1/auth/login - User login
+app.post('/api/v1/auth/login', authRateLimit, async (req, res) => {
+  try {
+    const { email, password } = req.body;
+
+    if (!email || !password) {
+      return res.status(400).json({
+        error: 'Missing credentials',
+        message: 'Email and password are required'
+      });
+    }
+
+    // Find user
+    const user = await userRepo.findByEmail(email);
+    if (!user) {
+      return res.status(401).json({
+        error: 'Invalid credentials',
+        message: 'Email or password is incorrect'
+      });
+    }
+
+    // Verify password
+    const passwordValid = await verifyPassword(password, user.password_hash);
+    if (!passwordValid) {
+      return res.status(401).json({
+        error: 'Invalid credentials',
+        message: 'Email or password is incorrect'
+      });
+    }
+
+    // Check if user is active
+    if (!user.is_active) {
+      return res.status(403).json({
+        error: 'Account disabled',
+        message: 'Your account has been disabled'
+      });
+    }
+
+    // Update last login
+    await userRepo.updateLastLogin(user.id);
+
+    // Generate JWT token
+    const token = generateToken({
+      userId: user.id,
+      username: user.username,
+      email: user.email,
+      role: user.role
+    });
+
+    logger.info(`User logged in: ${user.username}`);
+
+    res.json({
+      message: 'Login successful',
+      user: {
+        id: user.id,
+        username: user.username,
+        email: user.email,
+        full_name: user.full_name,
+        role: user.role
+      },
+      token
+    });
+  } catch (error) {
+    logger.error('Login error:', error);
+    res.status(500).json({
+      error: 'Login failed',
+      message: 'An error occurred during login'
+    });
+  }
+});
+
+// GET /api/v1/auth/me - Get current user
+app.get('/api/v1/auth/me', authenticate, async (req, res) => {
+  try {
+    const user = await userRepo.findById(req.user.id);
+
+    if (!user) {
+      return res.status(404).json({
+        error: 'User not found'
+      });
+    }
+
+    res.json({ user });
+  } catch (error) {
+    logger.error('Get user error:', error);
+    res.status(500).json({
+      error: 'Failed to get user information'
+    });
+  }
+});
+
+// ============================================================================
 // ROUTES: Components
 // ============================================================================
 
-// Моковые данные для демонстрации
-const mockComponents = [
-  {
-    id: '550e8400-e29b-41d4-a716-446655440001',
-    content_hash: 'sha256:a3f5c8b9d2e1f4a7c6b8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0',
-    name: 'jwt-generator',
-    version: '2.1.3',
-    description: 'JWT token generation and validation',
-    author: {
-      id: '660e8400-e29b-41d4-a716-446655440002',
-      name: 'John Doe',
-      email: 'john@example.com'
-    },
-    category: 'authentication',
-    language: 'javascript',
-    license: 'MIT',
-    downloads: 1523456,
-    stars: 8234,
-    created_at: '2024-01-15T10:30:00Z',
-    updated_at: '2024-03-20T14:45:00Z'
-  },
-  {
-    id: '550e8400-e29b-41d4-a716-446655440002',
-    content_hash: 'sha256:b4c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7',
-    name: 'oauth2-provider',
-    version: '3.0.1',
-    description: 'OAuth 2.0 provider implementation',
-    author: {
-      id: '660e8400-e29b-41d4-a716-446655440003',
-      name: 'Jane Smith',
-      email: 'jane@example.com'
-    },
-    category: 'authentication',
-    language: 'javascript',
-    license: 'Apache-2.0',
-    downloads: 892341,
-    stars: 5432,
-    created_at: '2024-02-10T08:20:00Z',
-    updated_at: '2024-03-15T11:30:00Z'
-  },
-  {
-    id: '550e8400-e29b-41d4-a716-446655440003',
-    content_hash: 'sha256:c5d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8',
-    name: 'postgres-orm',
-    version: '5.1.2',
-    description: 'PostgreSQL ORM with TypeScript support',
-    author: {
-      id: '660e8400-e29b-41d4-a716-446655440004',
-      name: 'Bob Wilson',
-      email: 'bob@example.com'
-    },
-    category: 'data',
-    language: 'typescript',
-    license: 'MIT',
-    downloads: 2341567,
-    stars: 12345,
-    created_at: '2023-11-05T14:15:00Z',
-    updated_at: '2024-03-18T09:45:00Z'
-  }
-];
-
 // GET /api/v1/components - Список компонентов
-app.get('/api/v1/components', (req, res) => {
-  const {
-    category,
-    language,
-    search,
-    limit = 10,
-    offset = 0
-  } = req.query;
-
-  let filtered = [...mockComponents];
-
-  // Фильтрация по категории
-  if (category) {
-    filtered = filtered.filter(c => c.category === category);
+app.get('/api/v1/components', async (req, res) => {
+  try {
+    const result = await componentRepo.findAll(req.query);
+    res.json(result);
+  } catch (error) {
+    logger.error('Error fetching components:', error);
+    res.status(500).json({
+      error: 'Failed to fetch components',
+      message: error.message
+    });
   }
-
-  // Фильтрация по языку
-  if (language) {
-    filtered = filtered.filter(c => c.language === language);
-  }
-
-  // Поиск
-  if (search) {
-    const searchLower = search.toLowerCase();
-    filtered = filtered.filter(c =>
-      c.name.toLowerCase().includes(searchLower) ||
-      c.description.toLowerCase().includes(searchLower)
-    );
-  }
-
-  // Пагинация
-  const total = filtered.length;
-  const paginated = filtered.slice(
-    parseInt(offset),
-    parseInt(offset) + parseInt(limit)
-  );
-
-  res.json({
-    data: paginated,
-    pagination: {
-      total,
-      limit: parseInt(limit),
-      offset: parseInt(offset),
-      hasMore: (parseInt(offset) + parseInt(limit)) < total
-    }
-  });
 });
 
 // GET /api/v1/components/:id - Получить компонент
-app.get('/api/v1/components/:id', (req, res) => {
-  const component = mockComponents.find(c => c.id === req.params.id);
+app.get('/api/v1/components/:id', async (req, res) => {
+  try {
+    const component = await componentRepo.findById(req.params.id);
 
-  if (!component) {
-    return res.status(404).json({
-      error: 'Component not found',
-      id: req.params.id
+    if (!component) {
+      return res.status(404).json({
+        error: 'Component not found',
+        id: req.params.id
+      });
+    }
+
+    res.json(component);
+  } catch (error) {
+    logger.error('Error fetching component:', error);
+    res.status(500).json({
+      error: 'Failed to fetch component',
+      message: error.message
     });
   }
-
-  // Расширенная информация
-  const detailed = {
-    ...component,
-    dependencies: [
-      {
-        id: '550e8400-e29b-41d4-a716-446655440099',
-        name: 'crypto-utils',
-        version: '^3.0.0'
-      }
-    ],
-    exports: [
-      {
-        name: 'generateToken',
-        type: 'function',
-        signature: '(payload: object, secret: string, options?: object) => string'
-      },
-      {
-        name: 'verifyToken',
-        type: 'function',
-        signature: '(token: string, secret: string) => object | null'
-      }
-    ],
-    quality: {
-      testCoverage: 95.2,
-      securityScore: 98,
-      maintainability: 'A'
-    }
-  };
-
-  res.json(detailed);
 });
 
 // POST /api/v1/components - Создать компонент
-app.post('/api/v1/components', (req, res) => {
-  const { name, version, description, category, language, code } = req.body;
+app.post('/api/v1/components', authenticate, async (req, res) => {
+  try {
+    const { name, version, description, readme, category, language, code, license } = req.body;
 
-  // Валидация
-  if (!name || !version || !code) {
-    return res.status(400).json({
-      error: 'Missing required fields',
-      required: ['name', 'version', 'code']
+    // Валидация
+    if (!name || !version || !code) {
+      return res.status(400).json({
+        error: 'Missing required fields',
+        required: ['name', 'version', 'code']
+      });
+    }
+
+    // Calculate content hash
+    const crypto = require('crypto');
+    const content_hash = crypto.createHash('sha256').update(code).digest('hex');
+
+    // Check for duplicate by content hash
+    const existing = await componentRepo.findByContentHash(content_hash);
+    if (existing) {
+      return res.status(409).json({
+        error: 'Duplicate component',
+        message: 'A component with identical code already exists',
+        existing: {
+          id: existing.id,
+          name: existing.name,
+          version: existing.version
+        }
+      });
+    }
+
+    // Create component
+    const newComponent = await componentRepo.create({
+      content_hash,
+      name,
+      version,
+      description,
+      readme,
+      category: category || 'Utilities',
+      language: language || 'JavaScript',
+      license: license || 'MIT',
+      author_id: req.user.id,
+      code_content: code,
+      size_bytes: Buffer.byteLength(code, 'utf8')
+    });
+
+    logger.info(`Component created: ${name}@${version} by ${req.user.username}`);
+
+    res.status(201).json({
+      message: 'Component created successfully',
+      component: newComponent
+    });
+  } catch (error) {
+    logger.error('Error creating component:', error);
+    res.status(500).json({
+      error: 'Failed to create component',
+      message: error.message
     });
   }
-
-  // Создание нового компонента (мок)
-  const newComponent = {
-    id: `550e8400-e29b-41d4-a716-${Date.now()}`,
-    content_hash: `sha256:${Buffer.from(code).toString('hex').substring(0, 64)}`,
-    name,
-    version,
-    description,
-    category: category || 'utilities',
-    language: language || 'javascript',
-    license: 'MIT',
-    downloads: 0,
-    stars: 0,
-    created_at: new Date().toISOString(),
-    updated_at: new Date().toISOString()
-  };
-
-  mockComponents.push(newComponent);
-
-  logger.info(`Component created: ${name}@${version}`);
-
-  res.status(201).json({
-    message: 'Component created successfully',
-    component: newComponent
-  });
 });
 
 // PUT /api/v1/components/:id - Обновить компонент
-app.put('/api/v1/components/:id', (req, res) => {
-  const index = mockComponents.findIndex(c => c.id === req.params.id);
+app.put('/api/v1/components/:id', authenticate, async (req, res) => {
+  try {
+    const component = await componentRepo.findById(req.params.id);
 
-  if (index === -1) {
-    return res.status(404).json({
-      error: 'Component not found'
+    if (!component) {
+      return res.status(404).json({
+        error: 'Component not found'
+      });
+    }
+
+    // Check if user is the author or admin
+    if (component.author_id !== req.user.id && req.user.role !== 'admin') {
+      return res.status(403).json({
+        error: 'Forbidden',
+        message: 'You can only update your own components'
+      });
+    }
+
+    const updated = await componentRepo.update(req.params.id, req.body);
+
+    logger.info(`Component updated: ${component.name}@${component.version} by ${req.user.username}`);
+
+    res.json({
+      message: 'Component updated successfully',
+      component: updated
+    });
+  } catch (error) {
+    logger.error('Error updating component:', error);
+    res.status(500).json({
+      error: 'Failed to update component',
+      message: error.message
     });
   }
-
-  const updated = {
-    ...mockComponents[index],
-    ...req.body,
-    updated_at: new Date().toISOString()
-  };
-
-  mockComponents[index] = updated;
-
-  res.json({
-    message: 'Component updated successfully',
-    component: updated
-  });
 });
 
 // DELETE /api/v1/components/:id - Удалить компонент
-app.delete('/api/v1/components/:id', (req, res) => {
-  const index = mockComponents.findIndex(c => c.id === req.params.id);
+app.delete('/api/v1/components/:id', authenticate, authorize('admin', 'moderator'), async (req, res) => {
+  try {
+    const component = await componentRepo.findById(req.params.id);
 
-  if (index === -1) {
-    return res.status(404).json({
-      error: 'Component not found'
+    if (!component) {
+      return res.status(404).json({
+        error: 'Component not found'
+      });
+    }
+
+    // Only admins and moderators can delete components
+    await componentRepo.delete(req.params.id);
+
+    logger.info(`Component deleted: ${component.name}@${component.version} by ${req.user.username}`);
+
+    res.json({
+      message: 'Component deleted successfully',
+      component: {
+        id: component.id,
+        name: component.name,
+        version: component.version
+      }
+    });
+  } catch (error) {
+    logger.error('Error deleting component:', error);
+    res.status(500).json({
+      error: 'Failed to delete component',
+      message: error.message
     });
   }
-
-  const deleted = mockComponents.splice(index, 1)[0];
-
-  res.json({
-    message: 'Component deleted successfully',
-    component: deleted
-  });
 });
 
 // GET /api/v1/components/:id/download - Скачать компонент
-app.get('/api/v1/components/:id/download', (req, res) => {
-  const component = mockComponents.find(c => c.id === req.params.id);
+app.get('/api/v1/components/:id/download', optionalAuthenticate, async (req, res) => {
+  try {
+    const component = await componentRepo.findById(req.params.id);
 
-  if (!component) {
-    return res.status(404).json({
-      error: 'Component not found'
+    if (!component) {
+      return res.status(404).json({
+        error: 'Component not found'
+      });
+    }
+
+    // Track download
+    const userId = req.user ? req.user.id : null;
+    const ipAddress = req.ip || req.connection.remoteAddress;
+    const userAgent = req.headers['user-agent'];
+
+    await componentRepo.incrementDownloads(req.params.id, userId, ipAddress, userAgent);
+
+    logger.info(`Component downloaded: ${component.name}@${component.version}`);
+
+    res.setHeader('Content-Type', 'application/javascript');
+    res.setHeader('Content-Disposition', `attachment; filename="${component.name}-${component.version}.js"`);
+    res.send(component.code_content);
+  } catch (error) {
+    logger.error('Error downloading component:', error);
+    res.status(500).json({
+      error: 'Failed to download component',
+      message: error.message
     });
   }
-
-  // Моковый код компонента
-  const code = `
-/**
- * ${component.name}@${component.version}
- * ${component.description}
- */
-
-module.exports = {
-  // Component implementation
-};
-  `.trim();
-
-  res.setHeader('Content-Type', 'application/javascript');
-  res.setHeader('Content-Disposition', `attachment; filename="${component.name}-${component.version}.js"`);
-  res.send(code);
 });
 
 // ============================================================================
 // ROUTES: Search
 // ============================================================================
 
-app.get('/api/v1/search', (req, res) => {
-  const { q, category, language, limit = 10 } = req.query;
+app.get('/api/v1/search', async (req, res) => {
+  try {
+    const { q, limit = 10 } = req.query;
 
-  if (!q) {
-    return res.status(400).json({
-      error: 'Missing search query parameter "q"'
+    if (!q) {
+      return res.status(400).json({
+        error: 'Missing search query parameter "q"'
+      });
+    }
+
+    const result = await componentRepo.search(q, parseInt(limit));
+    res.json(result);
+  } catch (error) {
+    logger.error('Error searching components:', error);
+    res.status(500).json({
+      error: 'Search failed',
+      message: error.message
     });
   }
-
-  const searchLower = q.toLowerCase();
-  let results = mockComponents.filter(c =>
-    c.name.toLowerCase().includes(searchLower) ||
-    c.description.toLowerCase().includes(searchLower)
-  );
-
-  if (category) {
-    results = results.filter(c => c.category === category);
-  }
-
-  if (language) {
-    results = results.filter(c => c.language === language);
-  }
-
-  results = results.slice(0, parseInt(limit));
-
-  res.json({
-    query: q,
-    results,
-    total: results.length
-  });
 });
 
 // ============================================================================
 // ROUTES: Categories
 // ============================================================================
 
-app.get('/api/v1/categories', (req, res) => {
-  const categories = [...new Set(mockComponents.map(c => c.category))];
+app.get('/api/v1/categories', async (req, res) => {
+  try {
+    const stats = await componentRepo.getStats();
+    const categories = Object.entries(stats.categories).map(([name, count]) => ({
+      name,
+      count
+    }));
 
-  const categoriesWithCounts = categories.map(cat => ({
-    name: cat,
-    count: mockComponents.filter(c => c.category === cat).length
-  }));
-
-  res.json({
-    categories: categoriesWithCounts
-  });
+    res.json({ categories });
+  } catch (error) {
+    logger.error('Error fetching categories:', error);
+    res.status(500).json({
+      error: 'Failed to fetch categories',
+      message: error.message
+    });
+  }
 });
 
 // ============================================================================
 // ROUTES: Dependencies
 // ============================================================================
 
-app.post('/api/v1/resolve', (req, res) => {
-  const { components } = req.body;
+app.post('/api/v1/resolve', async (req, res) => {
+  try {
+    const { components } = req.body;
 
-  if (!components || !Array.isArray(components)) {
-    return res.status(400).json({
-      error: 'Invalid request body. Expected { components: [...] }'
+    if (!components || !Array.isArray(components)) {
+      return res.status(400).json({
+        error: 'Invalid request body. Expected { components: [...] }'
+      });
+    }
+
+    // TODO: Implement actual dependency resolution using DependencyResolver
+    const resolved = components.map(comp => ({
+      name: comp.name || comp,
+      version: comp.version || 'latest',
+      resolved_version: '1.0.0',
+      dependencies: []
+    }));
+
+    res.json({
+      resolved,
+      graph: {
+        nodes: resolved.map(r => ({ id: `${r.name}@${r.resolved_version}` })),
+        edges: []
+      }
+    });
+  } catch (error) {
+    logger.error('Error resolving dependencies:', error);
+    res.status(500).json({
+      error: 'Failed to resolve dependencies',
+      message: error.message
     });
   }
-
-  // Моковое разрешение зависимостей
-  const resolved = components.map(comp => ({
-    name: comp.name || comp,
-    version: comp.version || 'latest',
-    resolved_version: '1.0.0',
-    dependencies: []
-  }));
-
-  res.json({
-    resolved,
-    graph: {
-      nodes: resolved.map(r => ({ id: `${r.name}@${r.resolved_version}` })),
-      edges: []
-    }
-  });
 });
 
-app.get('/api/v1/components/:id/dependents', (req, res) => {
-  // Моковые зависимые компоненты
-  res.json({
-    dependents: [
-      {
-        id: '550e8400-e29b-41d4-a716-446655440099',
-        name: 'user-auth-service',
-        version: '1.5.2'
-      }
-    ],
-    total: 1
-  });
+app.get('/api/v1/components/:id/dependents', async (req, res) => {
+  try {
+    const dependents = await componentRepo.getDependents(req.params.id);
+
+    res.json({
+      dependents,
+      total: dependents.length
+    });
+  } catch (error) {
+    logger.error('Error fetching dependents:', error);
+    res.status(500).json({
+      error: 'Failed to fetch dependents',
+      message: error.message
+    });
+  }
 });
 
 // ============================================================================
 // ROUTES: Statistics
 // ============================================================================
 
-app.get('/api/v1/stats', (req, res) => {
-  res.json({
-    totalComponents: mockComponents.length,
-    totalDownloads: mockComponents.reduce((sum, c) => sum + c.downloads, 0),
-    totalStars: mockComponents.reduce((sum, c) => sum + c.stars, 0),
-    categories: {
-      authentication: mockComponents.filter(c => c.category === 'authentication').length,
-      data: mockComponents.filter(c => c.category === 'data').length
-    },
-    languages: {
-      javascript: mockComponents.filter(c => c.language === 'javascript').length,
-      typescript: mockComponents.filter(c => c.language === 'typescript').length
-    }
-  });
+app.get('/api/v1/stats', async (req, res) => {
+  try {
+    const stats = await componentRepo.getStats();
+    res.json(stats);
+  } catch (error) {
+    logger.error('Error fetching stats:', error);
+    res.status(500).json({
+      error: 'Failed to fetch statistics',
+      message: error.message
+    });
+  }
 });
 
 // ============================================================================
 // ROUTES: Trending
 // ============================================================================
 
-app.get('/api/v1/trending', (req, res) => {
-  const { period = 'week', limit = 10 } = req.query;
+app.get('/api/v1/trending', async (req, res) => {
+  try {
+    const { period = 'week', limit = 10 } = req.query;
+    const trending = await componentRepo.getTrending(period, parseInt(limit));
 
-  // Сортировка по популярности (downloads + stars)
-  const trending = [...mockComponents]
-    .sort((a, b) => (b.downloads + b.stars * 10) - (a.downloads + a.stars * 10))
-    .slice(0, parseInt(limit));
-
-  res.json({
-    period,
-    trending
-  });
+    res.json({
+      period,
+      trending
+    });
+  } catch (error) {
+    logger.error('Error fetching trending components:', error);
+    res.status(500).json({
+      error: 'Failed to fetch trending components',
+      message: error.message
+    });
+  }
 });
 
 // ============================================================================
@@ -498,10 +635,49 @@ app.use((err, req, res, next) => {
 
 const PORT = process.env.PORT || 3000;
 
-app.listen(PORT, () => {
-  logger.info(`🚀 T-Hub API Server running on port ${PORT}`);
-  logger.info(`📚 API Documentation: http://localhost:${PORT}/api/v1/status`);
-  logger.info(`💚 Health check: http://localhost:${PORT}/health`);
+async function startServer() {
+  try {
+    // Test database connection
+    logger.info('Testing database connection...');
+    const connected = await db.testConnection();
+
+    if (!connected) {
+      logger.error('Failed to connect to database');
+      process.exit(1);
+    }
+
+    // Run migrations
+    if (process.env.RUN_MIGRATIONS !== 'false') {
+      logger.info('Running database migrations...');
+      await db.migrate();
+    }
+
+    // Start server
+    app.listen(PORT, () => {
+      logger.info(`🚀 T-Hub API Server running on port ${PORT}`);
+      logger.info(`📚 API Documentation: http://localhost:${PORT}/api-docs`);
+      logger.info(`📊 API Status: http://localhost:${PORT}/api/v1/status`);
+      logger.info(`💚 Health check: http://localhost:${PORT}/health`);
+    });
+  } catch (error) {
+    logger.error('Failed to start server:', error);
+    process.exit(1);
+  }
+}
+
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+  logger.info('SIGTERM signal received: closing HTTP server');
+  await db.close();
+  process.exit(0);
 });
+
+process.on('SIGINT', async () => {
+  logger.info('SIGINT signal received: closing HTTP server');
+  await db.close();
+  process.exit(0);
+});
+
+startServer();
 
 module.exports = app;
